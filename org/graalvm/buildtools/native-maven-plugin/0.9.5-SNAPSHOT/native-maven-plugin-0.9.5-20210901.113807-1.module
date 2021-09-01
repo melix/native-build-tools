@@ -1,0 +1,116 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "org.graalvm.buildtools",
+    "module": "native-maven-plugin",
+    "version": "0.9.5-SNAPSHOT",
+    "attributes": {
+      "org.gradle.status": "integration"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "7.0.2"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 8,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "native-maven-plugin-0.9.5-SNAPSHOT.jar",
+          "url": "native-maven-plugin-0.9.5-SNAPSHOT.jar",
+          "size": 27201,
+          "sha512": "a8d015e4ba187e1cdd6e0e09cc7d75111fc6b61966be48a04855ad231c0d3921ce622966fa5bcb9f935c9cc0fa189e6276306f81812b2f5ec92d5d3834cc0127",
+          "sha256": "b24b059a102e91b8cfaa512b96cf793c0ed664b859f5a5c43f1b795c31bcb5d9",
+          "sha1": "f82567cf7faf39b991d211b30c198d78a1be27cd",
+          "md5": "28254ba7041f36cf04724390766e23c2"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 8,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.graalvm.buildtools",
+          "module": "utils",
+          "version": {
+            "requires": "0.9.5-SNAPSHOT"
+          }
+        },
+        {
+          "group": "com.fasterxml.jackson.core",
+          "module": "jackson-databind",
+          "version": {
+            "requires": "2.12.4"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "native-maven-plugin-0.9.5-SNAPSHOT.jar",
+          "url": "native-maven-plugin-0.9.5-SNAPSHOT.jar",
+          "size": 27201,
+          "sha512": "a8d015e4ba187e1cdd6e0e09cc7d75111fc6b61966be48a04855ad231c0d3921ce622966fa5bcb9f935c9cc0fa189e6276306f81812b2f5ec92d5d3834cc0127",
+          "sha256": "b24b059a102e91b8cfaa512b96cf793c0ed664b859f5a5c43f1b795c31bcb5d9",
+          "sha1": "f82567cf7faf39b991d211b30c198d78a1be27cd",
+          "md5": "28254ba7041f36cf04724390766e23c2"
+        }
+      ]
+    },
+    {
+      "name": "javadocElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "javadoc",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "native-maven-plugin-0.9.5-SNAPSHOT-javadoc.jar",
+          "url": "native-maven-plugin-0.9.5-SNAPSHOT-javadoc.jar",
+          "size": 418985,
+          "sha512": "01885c2821dc271421913a675f069d7a16dd0ccceb0a596b67f5410a56341cbcb174a1e5b45a8c23b95383df71c1b8415aec806726429c4e33a029f3af0299d1",
+          "sha256": "bde261253896616ddb00a3c64bc40de6039e841572fc1953cbef65ea44e9cdae",
+          "sha1": "f78014b1f70e74e07a18a34ebd5a2b87eb828f8c",
+          "md5": "6d3003a9324cff27c0188cb7cfb72553"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "native-maven-plugin-0.9.5-SNAPSHOT-sources.jar",
+          "url": "native-maven-plugin-0.9.5-SNAPSHOT-sources.jar",
+          "size": 18380,
+          "sha512": "c48d36f50ceb0684ebb8fb68f9beccd69d0ee93a44139cf8831c3de45a21fdb240f940546eed22dc3d793359652d17e60c00d92728a6600162e2b149d589ed1d",
+          "sha256": "77a13e829fcab4d484d9085301326b6eaa89e89b8f15114f55f9712da8d86abb",
+          "sha1": "ddc5d65057d165ae6bbc52eccb5dfc3ab5e31076",
+          "md5": "bf05fa2d7baf5b15251e3f7b684ebcfa"
+        }
+      ]
+    }
+  ]
+}
