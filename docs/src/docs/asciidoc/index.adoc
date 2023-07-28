@@ -21,6 +21,10 @@ If you are using alternative build systems, see <<alternative-build-systems.adoc
 
 === Release 0.9.24
 
+==== Junit extension
+
+* Fix compatibility with JUnit 5.10
+
 ==== Gradle plugin
 
 * Add support for PGO
