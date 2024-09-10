@@ -55,6 +55,7 @@ import org.gradle.api.file.RegularFile;
 import org.gradle.api.file.RegularFileProperty;
 import org.gradle.api.model.ObjectFactory;
 import org.gradle.api.plugins.JavaBasePlugin;
+import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.MapProperty;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
@@ -114,6 +115,12 @@ public abstract class BuildNativeImageTask extends DefaultTask {
         getOptions().get().getPgoInstrument().set(true);
     }
 
+    @Option(option = "use-layers", description = "Enables Native Image layered builds")
+    public void overrideUseLayers() {
+        getOptions().get().getUseLayers().set(true);
+    }
+
+
     @Inject
     protected abstract ExecOperations getExecOperations();
 
@@ -133,10 +140,27 @@ public abstract class BuildNativeImageTask extends DefaultTask {
         return graalvmHomeProvider;
     }
 
+    @Optional
+    @Nested
+    public abstract ListProperty<LayerOptions> getLayerOptions();
+
+    @Internal
+    public Provider<RegularFile> getCreatedLayerFile() {
+        if (getLayerOptions().isPresent()) {
+            var createdLayer = getLayerOptions().get().stream()
+                .filter(o -> o.getMode().get().equals(LayerMode.CREATE))
+                .findFirst();
+            if (createdLayer.isPresent()) {
+                return getOutputDirectory().zip(createdLayer.get().getLayerName(), Directory::file);
+            }
+        }
+        return null;
+    }
+
     @Internal
     public Provider<String> getExecutableShortName() {
         return getOptions().flatMap(options ->
-                options.getImageName().zip(options.getPgoInstrument(), serializableBiFunctionOf((name, pgo) -> name + (Boolean.TRUE.equals(pgo) ? "-instrumented" : "")))
+            options.getImageName().zip(options.getPgoInstrument(), serializableBiFunctionOf((name, pgo) -> name + (Boolean.TRUE.equals(pgo) ? "-instrumented" : "")))
         );
     }
 
@@ -184,16 +208,18 @@ public abstract class BuildNativeImageTask extends DefaultTask {
     private List<String> buildActualCommandLineArgs(int majorJDKVersion) {
         getOptions().finalizeValue();
         return new NativeImageCommandLineProvider(
-                getOptions(),
-                getExecutableShortName(),
-                getProviders().provider(() -> getWorkingDirectory().get().getAsFile().getAbsolutePath()),
-                // Can't use getOutputDirectory().map(...) because Gradle would complain that we use
-                // a mapped value before the task was called, when we are actually calling it...
-                getProviders().provider(() -> getOutputDirectory().getAsFile().get().getAbsolutePath()),
-                getClasspathJar(),
-                getUseArgFile(),
-                getProviders().provider(() -> majorJDKVersion),
-                getProviders().provider(() -> useColors)).asArguments();
+            getOptions(),
+            getExecutableShortName(),
+            getProviders().provider(() -> getWorkingDirectory().get().getAsFile().getAbsolutePath()),
+            // Can't use getOutputDirectory().map(...) because Gradle would complain that we use
+            // a mapped value before the task was called, when we are actually calling it...
+            getProviders().provider(() -> getOutputDirectory().getAsFile().get().getAbsolutePath()),
+            getClasspathJar(),
+            getUseArgFile(),
+            getProviders().provider(() -> majorJDKVersion),
+            getProviders().provider(() -> useColors),
+            getLayerOptions())
+            .asArguments();
     }
 
     // This property provides access to the service instance
@@ -208,12 +234,12 @@ public abstract class BuildNativeImageTask extends DefaultTask {
         GraalVMLogger logger = GraalVMLogger.of(getLogger());
 
         File executablePath = NativeImageExecutableLocator.findNativeImageExecutable(
-                options.getJavaLauncher(),
-                getDisableToolchainDetection(),
-                getGraalVMHome(),
-                getExecOperations(),
-                logger,
-                diagnostics);
+            options.getJavaLauncher(),
+            getDisableToolchainDetection(),
+            getGraalVMHome(),
+            getExecOperations(),
+            logger,
+            diagnostics);
         String versionString = getVersionString(getExecOperations(), executablePath);
         if (options.getRequiredVersion().isPresent()) {
             NativeImageUtils.checkVersion(options.getRequiredVersion().get(), versionString);

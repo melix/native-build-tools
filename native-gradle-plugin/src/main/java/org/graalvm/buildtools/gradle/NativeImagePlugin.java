@@ -46,8 +46,11 @@ import org.graalvm.buildtools.agent.AgentConfiguration;
 import org.graalvm.buildtools.agent.AgentMode;
 import org.graalvm.buildtools.gradle.dsl.GraalVMExtension;
 import org.graalvm.buildtools.gradle.dsl.GraalVMReachabilityMetadataRepositoryExtension;
+import org.graalvm.buildtools.gradle.dsl.NativeImageCompileOptions;
 import org.graalvm.buildtools.gradle.dsl.NativeImageOptions;
+import org.graalvm.buildtools.gradle.dsl.NativeResourcesOptions;
 import org.graalvm.buildtools.gradle.dsl.agent.AgentOptions;
+import org.graalvm.buildtools.gradle.dsl.agent.DeprecatedAgentOptions;
 import org.graalvm.buildtools.gradle.internal.AgentCommandLineProvider;
 import org.graalvm.buildtools.gradle.internal.BaseNativeImageOptions;
 import org.graalvm.buildtools.gradle.internal.DefaultGraalVmExtension;
@@ -60,11 +63,14 @@ import org.graalvm.buildtools.gradle.internal.agent.AgentConfigurationFactory;
 import org.graalvm.buildtools.gradle.tasks.BuildNativeImageTask;
 import org.graalvm.buildtools.gradle.tasks.CollectReachabilityMetadata;
 import org.graalvm.buildtools.gradle.tasks.GenerateResourcesConfigFile;
+import org.graalvm.buildtools.gradle.tasks.LayerMode;
+import org.graalvm.buildtools.gradle.tasks.LayerOptions;
 import org.graalvm.buildtools.gradle.tasks.MetadataCopyTask;
 import org.graalvm.buildtools.gradle.tasks.NativeRunTask;
 import org.graalvm.buildtools.gradle.tasks.actions.CleanupAgentFilesAction;
 import org.graalvm.buildtools.gradle.tasks.actions.MergeAgentFilesAction;
 import org.graalvm.buildtools.gradle.tasks.actions.ProcessGeneratedGraalResourceFilesAction;
+import org.graalvm.buildtools.gradle.tasks.scanner.JarAnalyzerTransform;
 import org.graalvm.buildtools.utils.SharedConstants;
 import org.graalvm.reachability.DirectoryConfiguration;
 import org.gradle.api.Action;
@@ -72,12 +78,14 @@ import org.gradle.api.NamedDomainObjectContainer;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
+import org.gradle.api.artifacts.ArtifactCollection;
 import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.ConfigurationContainer;
 import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.ModuleVersionIdentifier;
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier;
 import org.gradle.api.artifacts.result.DependencyResult;
+import org.gradle.api.artifacts.result.ResolvedArtifactResult;
 import org.gradle.api.artifacts.result.ResolvedComponentResult;
 import org.gradle.api.artifacts.result.ResolvedDependencyResult;
 import org.gradle.api.attributes.Attribute;
@@ -91,6 +99,7 @@ import org.gradle.api.file.FileCollection;
 import org.gradle.api.file.FileSystemLocation;
 import org.gradle.api.file.FileSystemOperations;
 import org.gradle.api.logging.LogLevel;
+import org.gradle.api.model.ObjectFactory;
 import org.gradle.api.plugins.ExtensionAware;
 import org.gradle.api.plugins.JavaApplication;
 import org.gradle.api.plugins.JavaLibraryPlugin;
@@ -111,6 +120,7 @@ import org.gradle.api.tasks.TaskProvider;
 import org.gradle.api.tasks.bundling.AbstractArchiveTask;
 import org.gradle.api.tasks.bundling.Jar;
 import org.gradle.api.tasks.testing.Test;
+import org.gradle.jvm.toolchain.JavaLauncher;
 import org.gradle.jvm.toolchain.JavaToolchainService;
 import org.gradle.language.base.plugins.LifecycleBasePlugin;
 import org.gradle.process.CommandLineArgumentProvider;
@@ -126,6 +136,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -165,6 +176,7 @@ public class NativeImagePlugin implements Plugin<Project> {
     public static final String DEPRECATED_NATIVE_TEST_BUILD_TASK = "nativeTestBuild";
 
     public static final String CONFIG_REPO_LOGLEVEL = "org.graalvm.internal.gradle.configrepo.logging";
+    public static final Attribute<Boolean> JAR_ANALYSIS_ATTRIBUTE = Attribute.of("jar-analysis", Boolean.class);
 
     private static final String JUNIT_PLATFORM_LISTENERS_UID_TRACKING_ENABLED = "junit.platform.listeners.uid.tracking.enabled";
     private static final String JUNIT_PLATFORM_LISTENERS_UID_TRACKING_OUTPUT_DIR = "junit.platform.listeners.uid.tracking.output.dir";
@@ -189,6 +201,8 @@ public class NativeImagePlugin implements Plugin<Project> {
     }
 
 
+    private Map<NativeImageCompileOptions, NativeConfigurations> optionsToConfigurations = new HashMap<>();
+
     @Override
     public void apply(@Nonnull Project project) {
         Provider<NativeImageService> nativeImageServiceProvider = NativeImageService.registerOn(project);
@@ -197,7 +211,7 @@ public class NativeImagePlugin implements Plugin<Project> {
         DefaultGraalVmExtension graalExtension = (DefaultGraalVmExtension) registerGraalVMExtension(project);
         graalExtension.getUseArgFile().convention(IS_WINDOWS);
         project.getPlugins()
-                .withType(JavaPlugin.class, javaPlugin -> configureJavaProject(project, nativeImageServiceProvider, graalExtension));
+            .withType(JavaPlugin.class, javaPlugin -> configureJavaProject(project, nativeImageServiceProvider, graalExtension));
 
         project.getPlugins().withType(JavaLibraryPlugin.class, javaLibraryPlugin -> graalExtension.getAgent().getDefaultMode().convention("conditional"));
 
@@ -250,12 +264,20 @@ public class NativeImagePlugin implements Plugin<Project> {
         NativeImageOptions mainOptions = createMainOptions(graalExtension, project);
 
         project.getPlugins().withId("application", p -> mainOptions.getMainClass().convention(
-                Objects.requireNonNull(project.getExtensions().findByType(JavaApplication.class)).getMainClass()
+            Objects.requireNonNull(project.getExtensions().findByType(JavaApplication.class)).getMainClass()
         ));
 
         project.getPlugins().withId("java-library", p -> mainOptions.getSharedLibrary().convention(true));
 
         registerServiceProvider(project, nativeImageServiceProvider);
+
+        // Configure artifact transform which allows extracting the package list from jars
+        project.getDependencies().getAttributesSchema().attribute(JAR_ANALYSIS_ATTRIBUTE);
+        project.getDependencies().getArtifactTypes().getByName("jar").getAttributes().attribute(JAR_ANALYSIS_ATTRIBUTE, false);
+        project.getDependencies().registerTransform(JarAnalyzerTransform.class, t -> {
+            t.getFrom().attribute(JAR_ANALYSIS_ATTRIBUTE, false);
+            t.getTo().attribute(JAR_ANALYSIS_ATTRIBUTE, true);
+        });
 
         // Register Native Image tasks
         TaskContainer tasks = project.getTasks();
@@ -290,14 +312,14 @@ public class NativeImagePlugin implements Plugin<Project> {
 
         GraalVMReachabilityMetadataRepositoryExtension metadataRepositoryExtension = reachabilityExtensionOn(graalExtension);
         TaskCollection<CollectReachabilityMetadata> reachabilityMetadataCopyTasks = project.getTasks()
-                .withType(CollectReachabilityMetadata.class);
+            .withType(CollectReachabilityMetadata.class);
         reachabilityMetadataCopyTasks.configureEach(task -> {
             Provider<GraalVMReachabilityMetadataService> reachabilityMetadataService = graalVMReachabilityMetadataService(
-                    project, metadataRepositoryExtension);
+                project, metadataRepositoryExtension);
             task.getMetadataService().set(reachabilityMetadataService);
             task.usesService(reachabilityMetadataService);
             task.getUri().convention(task.getVersion().map(serializableTransformerOf(this::getReachabilityMetadataRepositoryUrlForVersion))
-                    .orElse(metadataRepositoryExtension.getUri()));
+                .orElse(metadataRepositoryExtension.getUri()));
             task.getExcludedModules().convention(metadataRepositoryExtension.getExcludedModules());
             task.getModuleToConfigVersion().convention(metadataRepositoryExtension.getModuleToConfigVersion());
             task.getInto().convention(project.getLayout().getBuildDirectory().dir("native-reachability-metadata"));
@@ -308,6 +330,7 @@ public class NativeImagePlugin implements Plugin<Project> {
                                                 GraalVMExtension graalExtension,
                                                 TaskContainer tasks,
                                                 SourceSetContainer sourceSets) {
+        var providers = project.getProviders();
         graalExtension.getBinaries().configureEach(options -> {
             String binaryName = options.getName();
             String compileTaskName = deriveTaskName(binaryName, "native", "Compile");
@@ -315,12 +338,67 @@ public class NativeImagePlugin implements Plugin<Project> {
                 compileTaskName = NATIVE_COMPILE_TASK_NAME;
             }
             TaskProvider<BuildNativeImageTask> imageBuilder = tasks.register(compileTaskName,
-                    BuildNativeImageTask.class, builder -> {
-                        builder.setDescription("Compiles a native image for the " + options.getName() + " binary");
-                        builder.setGroup(LifecycleBasePlugin.BUILD_GROUP);
-                        builder.getOptions().convention(options);
-                        builder.getUseArgFile().convention(graalExtension.getUseArgFile());
-                    });
+                BuildNativeImageTask.class, builder -> {
+                    builder.setDescription("Compiles a native image for the " + options.getName() + " binary");
+                    builder.setGroup(LifecycleBasePlugin.BUILD_GROUP);
+                    builder.getOptions().convention(options);
+                    builder.getUseArgFile().convention(graalExtension.getUseArgFile());
+                });
+            if ("main".equals(binaryName)) {
+                ObjectFactory objects = project.getObjects();
+                var createDependenciesLayer = tasks.register("createDependenciesLayer", BuildNativeImageTask.class, builder -> {
+                    builder.setDescription("Creates a layer with the application dependencies");
+                    builder.setGroup(LifecycleBasePlugin.BUILD_GROUP);
+                    var configurations = optionsToConfigurations.get(options);
+                    var imageClasspathConfiguration = configurations.getImageClasspathConfiguration();
+                    var externalJars = imageClasspathConfiguration.getIncoming()
+                        .artifactView(view -> {
+                            view.setLenient(false);
+                            // limit to external dependencies
+                            view.componentFilter(c -> c instanceof ModuleComponentIdentifier);
+                        })
+                        .getArtifacts();
+                    var metadataFiles = imageClasspathConfiguration.getIncoming()
+                        .artifactView(view -> {
+                            view.setLenient(false);
+                            view.componentFilter(c -> c instanceof ModuleComponentIdentifier);
+                            view.getAttributes().attribute(JAR_ANALYSIS_ATTRIBUTE, true);
+                        })
+                        .getArtifacts();
+                    builder.getOptions().convention(new NativeImageOptionsForDependencies(options, externalJars, objects));
+                    builder.getUseArgFile().convention(graalExtension.getUseArgFile());
+                    var createLayer = project.getObjects().newInstance(LayerOptions.class);
+                    builder.getLayerOptions().add(createLayer);
+                    createLayer.getMode().convention(LayerMode.CREATE);
+                    createLayer.getLayerName().convention("lib-base-image");
+                    createLayer.getModules().convention(List.of("java.base"));
+                    // This is the real code, which needs to be used when https://jira.oci.oraclecorp.com/browse/GR-57117 is fixed
+//                    createLayer.getPackages().convention(metadataFiles.getResolvedArtifacts().map(analysis -> {
+//                        List<String> allPackages = analysis.stream()
+//                            .map(ResolvedArtifactResult::getFile)
+//                            .map(File::toPath)
+//                            .map(JarMetadata::readFrom)
+//                            .flatMap(m -> m.getPackageList().stream())
+//                            .sorted()
+//                            .distinct()
+//                            .collect(Collectors.toList());
+//                        return allPackages;
+//                    }));
+                    // TODO: remove when https://jira.oci.oraclecorp.com/browse/GR-57117 is fixed
+                    createLayer.getPackages().convention(externalJars.getResolvedArtifacts().map(artifacts -> artifacts.stream().map(ResolvedArtifactResult::getFile).map(Object::toString).collect(Collectors.toList())));
+                });
+                imageBuilder.configure(task -> {
+                    var layer = objects.newInstance(LayerOptions.class);
+                    layer.getMode().convention(LayerMode.USE);
+                    layer.getLayerName().convention(createDependenciesLayer.flatMap(t -> t.getCreatedLayerFile().map(f -> f.getAsFile().getAbsolutePath())));
+                    task.getLayerOptions().addAll(options.getUseLayers().map(useLayers -> {
+                        if (useLayers) {
+                            return List.of(layer);
+                        }
+                        return List.of();
+                    }));
+                });
+            }
             String runTaskName = deriveTaskName(binaryName, "native", "Run");
             if ("main".equals(binaryName)) {
                 runTaskName = NativeRunTask.TASK_NAME;
@@ -332,26 +410,33 @@ public class NativeImagePlugin implements Plugin<Project> {
                 task.setDescription("Executes the " + options.getName() + " native binary");
                 task.getImage().convention(imageBuilder.flatMap(BuildNativeImageTask::getOutputFile));
                 task.getRuntimeArgs().convention(options.getRuntimeArgs());
+                // TODO: This isn't great. Only works for Linux. There should be a more robust way to make this work.
+                task.getEnvironment().put("LD_LIBRARY_PATH", options.getUseLayers().flatMap(useLayers -> {
+                    if (useLayers) {
+                        return tasks.named("createDependenciesLayer", BuildNativeImageTask.class).map(BuildNativeImageTask::getOutputDirectory).flatMap(DirectoryProperty::getAsFile).map(File::getAbsolutePath);
+                    }
+                    return null;
+                }));
                 task.getInternalRuntimeArgs().convention(
-                        imageBuilder.zip(options.getPgoInstrument(), serializableBiFunctionOf((builder, pgo) -> {
-                                    if (Boolean.TRUE.equals(pgo)) {
-                                        File outputDir = builder.getOutputDirectory().get().getAsFile();
-                                        return Collections.singletonList("-XX:ProfilesDumpFile=" + new File(outputDir, "default.iprof").getAbsolutePath());
-                                    }
-                                    return Collections.emptyList();
-                                })
-                        ));
+                    imageBuilder.zip(options.getPgoInstrument(), serializableBiFunctionOf((builder, pgo) -> {
+                            if (Boolean.TRUE.equals(pgo)) {
+                                File outputDir = builder.getOutputDirectory().get().getAsFile();
+                                return Collections.singletonList("-XX:ProfilesDumpFile=" + new File(outputDir, "default.iprof").getAbsolutePath());
+                            }
+                            return Collections.emptyList();
+                        })
+                    ));
             });
             configureClasspathJarFor(tasks, options, imageBuilder);
             SourceSet sourceSet = "test".equals(binaryName) ? sourceSets.getByName(SourceSet.TEST_SOURCE_SET_NAME) : sourceSets.getByName(SourceSet.MAIN_SOURCE_SET_NAME);
             TaskProvider<GenerateResourcesConfigFile> generateResourcesConfig = registerResourcesConfigTask(
-                    graalExtension.getGeneratedResourcesDirectory(),
-                    options,
-                    tasks,
-                    transitiveProjectArtifacts(project, sourceSet.getRuntimeClasspathConfigurationName()),
-                    deriveTaskName(binaryName, "generate", "ResourcesConfigFile"));
+                graalExtension.getGeneratedResourcesDirectory(),
+                options,
+                tasks,
+                transitiveProjectArtifacts(project, sourceSet.getRuntimeClasspathConfigurationName()),
+                deriveTaskName(binaryName, "generate", "ResourcesConfigFile"));
             options.getConfigurationFileDirectories().from(generateResourcesConfig.map(serializableTransformerOf(t ->
-                    t.getOutputFile().map(serializableTransformerOf(f -> f.getAsFile().getParentFile()))
+                t.getOutputFile().map(serializableTransformerOf(f -> f.getAsFile().getParentFile()))
             )));
             configureJvmReachabilityConfigurationDirectories(project, graalExtension, options, sourceSet);
             configureJvmReachabilityExcludeConfigArgs(project, graalExtension, options, sourceSet);
@@ -363,10 +448,10 @@ public class NativeImagePlugin implements Plugin<Project> {
                                                                   NativeImageOptions options,
                                                                   SourceSet sourceSet) {
         options.getConfigurationFileDirectories().from(
-                graalVMReachabilityQueryForConfigDirectories(project,
-                        graalExtension,
-                        sourceSet,
-                        configuration -> true)
+            graalVMReachabilityQueryForConfigDirectories(project,
+                graalExtension,
+                sourceSet,
+                configuration -> true)
         );
     }
 
@@ -375,67 +460,67 @@ public class NativeImagePlugin implements Plugin<Project> {
     }
 
     private Provider<List<File>> graalVMReachabilityQueryForConfigDirectories(Project project, GraalVMExtension graalExtension,
-                                                 SourceSet sourceSet, Predicate<DirectoryConfiguration> filter) {
+                                                                              SourceSet sourceSet, Predicate<DirectoryConfiguration> filter) {
         GraalVMReachabilityMetadataRepositoryExtension extension = reachabilityExtensionOn(graalExtension);
         Provider<GraalVMReachabilityMetadataService> metadataServiceProvider = graalVMReachabilityMetadataService(project, extension);
         Provider<ResolvedComponentResult> rootComponent = project.getConfigurations()
-                .getByName(sourceSet.getRuntimeClasspathConfigurationName())
-                .getIncoming()
-                .getResolutionResult()
-                .getRootComponent();
+            .getByName(sourceSet.getRuntimeClasspathConfigurationName())
+            .getIncoming()
+            .getResolutionResult()
+            .getRootComponent();
         SetProperty<String> excludedModulesProperty = extension.getExcludedModules();
         MapProperty<String, String> moduleToConfigVersion = extension.getModuleToConfigVersion();
         Property<URI> uri = extension.getUri();
         ProviderFactory providers = project.getProviders();
         return extension.getEnabled().flatMap(serializableTransformerOf(enabled -> {
-                if (Boolean.TRUE.equals(enabled) && uri.isPresent()) {
-                    Set<String> excludedModules = excludedModulesProperty.getOrElse(Collections.emptySet());
-                    Map<String, String> forcedVersions = moduleToConfigVersion.getOrElse(Collections.emptyMap());
-                    return metadataServiceProvider.map(serializableTransformerOf(service -> {
-                        Set<ResolvedComponentResult> components = findAllComponentsFrom(rootComponent.get());
-                        return components.stream().flatMap(serializableFunctionOf(component -> {
-                            ModuleVersionIdentifier moduleVersion = component.getModuleVersion();
-                            Set<DirectoryConfiguration> configurations = service.findConfigurationsFor(excludedModules, forcedVersions, moduleVersion);
-                            return configurations.stream()
-                                    .filter(filter)
-                                    .map(NativeImagePlugin::getConfigurationDirectory);
-                        })).collect(Collectors.<File>toList());
-                    }));
-                }
-                return providers.provider(Collections::emptyList);
-            }));
+            if (Boolean.TRUE.equals(enabled) && uri.isPresent()) {
+                Set<String> excludedModules = excludedModulesProperty.getOrElse(Collections.emptySet());
+                Map<String, String> forcedVersions = moduleToConfigVersion.getOrElse(Collections.emptyMap());
+                return metadataServiceProvider.map(serializableTransformerOf(service -> {
+                    Set<ResolvedComponentResult> components = findAllComponentsFrom(rootComponent.get());
+                    return components.stream().flatMap(serializableFunctionOf(component -> {
+                        ModuleVersionIdentifier moduleVersion = component.getModuleVersion();
+                        Set<DirectoryConfiguration> configurations = service.findConfigurationsFor(excludedModules, forcedVersions, moduleVersion);
+                        return configurations.stream()
+                            .filter(filter)
+                            .map(NativeImagePlugin::getConfigurationDirectory);
+                    })).collect(Collectors.<File>toList());
+                }));
+            }
+            return providers.provider(Collections::emptyList);
+        }));
     }
 
     private Provider<Map<String, List<String>>> graalVMReachabilityQueryForExcludeList(Project project, GraalVMExtension graalExtension,
-                                                 SourceSet sourceSet, Predicate<DirectoryConfiguration> filter) {
+                                                                                       SourceSet sourceSet, Predicate<DirectoryConfiguration> filter) {
         GraalVMReachabilityMetadataRepositoryExtension extension = reachabilityExtensionOn(graalExtension);
         Provider<GraalVMReachabilityMetadataService> metadataServiceProvider = graalVMReachabilityMetadataService(project, extension);
         Provider<ResolvedComponentResult> rootComponent = project.getConfigurations()
-                .getByName(sourceSet.getRuntimeClasspathConfigurationName())
-                .getIncoming()
-                .getResolutionResult()
-                .getRootComponent();
+            .getByName(sourceSet.getRuntimeClasspathConfigurationName())
+            .getIncoming()
+            .getResolutionResult()
+            .getRootComponent();
         SetProperty<String> excludedModulesProperty = extension.getExcludedModules();
         MapProperty<String, String> moduleToConfigVersion = extension.getModuleToConfigVersion();
         Property<URI> uri = extension.getUri();
         ProviderFactory providers = project.getProviders();
         return extension.getEnabled().flatMap(serializableTransformerOf(enabled -> {
-                if (Boolean.TRUE.equals(enabled) && uri.isPresent()) {
-                    Set<String> excludedModules = excludedModulesProperty.getOrElse(Collections.emptySet());
-                    Map<String, String> forcedVersions = moduleToConfigVersion.getOrElse(Collections.emptyMap());
-                    return metadataServiceProvider.map(serializableTransformerOf(service -> {
-                        Set<ResolvedComponentResult> components = findAllComponentsFrom(rootComponent.get());
-                        return components.stream().flatMap(serializableFunctionOf(component -> {
-                            ModuleVersionIdentifier moduleVersion = component.getModuleVersion();
-                            Set<DirectoryConfiguration> configurations = service.findConfigurationsFor(excludedModules, forcedVersions, moduleVersion);
-                            return configurations.stream()
-                                    .filter(filter)
-                                    .map(e -> getExclusionConfig(moduleVersion));
-                        })).collect(Collectors.toMap(ExcludeEntry::getGav, ExcludeEntry::getExcludes));
-                    }));
-                }
-                return providers.provider(Collections::emptyMap);
-            }));
+            if (Boolean.TRUE.equals(enabled) && uri.isPresent()) {
+                Set<String> excludedModules = excludedModulesProperty.getOrElse(Collections.emptySet());
+                Map<String, String> forcedVersions = moduleToConfigVersion.getOrElse(Collections.emptyMap());
+                return metadataServiceProvider.map(serializableTransformerOf(service -> {
+                    Set<ResolvedComponentResult> components = findAllComponentsFrom(rootComponent.get());
+                    return components.stream().flatMap(serializableFunctionOf(component -> {
+                        ModuleVersionIdentifier moduleVersion = component.getModuleVersion();
+                        Set<DirectoryConfiguration> configurations = service.findConfigurationsFor(excludedModules, forcedVersions, moduleVersion);
+                        return configurations.stream()
+                            .filter(filter)
+                            .map(e -> getExclusionConfig(moduleVersion));
+                    })).collect(Collectors.toMap(ExcludeEntry::getGav, ExcludeEntry::getExcludes));
+                }));
+            }
+            return providers.provider(Collections::emptyMap);
+        }));
     }
 
     private static Set<ResolvedComponentResult> findAllComponentsFrom(ResolvedComponentResult resolvedComponentResult) {
@@ -458,21 +543,21 @@ public class NativeImagePlugin implements Plugin<Project> {
     private Provider<GraalVMReachabilityMetadataService> graalVMReachabilityMetadataService(Project project,
                                                                                             GraalVMReachabilityMetadataRepositoryExtension repositoryExtension) {
         return project.getGradle()
-                .getSharedServices()
-                .registerIfAbsent("nativeConfigurationService", GraalVMReachabilityMetadataService.class, spec -> {
-                    LogLevel logLevel = determineLogLevel();
-                    spec.getMaxParallelUsages().set(1);
-                    spec.getParameters().getLogLevel().set(logLevel);
-                    spec.getParameters().getUri().set(repositoryExtension.getUri().map(serializableTransformerOf(configuredUri -> computeMetadataRepositoryUri(project, repositoryExtension, m -> logFallbackToDefaultUri(m, logger)))));
-                    spec.getParameters().getCacheDir().set(
-                            new File(project.getGradle().getGradleUserHomeDir(), "native-build-tools/repositories"));
-                    spec.getParameters().getBackoffMaxRetries().convention(
-                        GradleUtils.intProperty(project.getProviders(), "exponential.backoff.max.retries", 3)
-                    );
-                    spec.getParameters().getInitialBackoffMillis().convention(
-                        GradleUtils.intProperty(project.getProviders(), "exponential.backoff.initial.delay", 100)
-                    );
-                });
+            .getSharedServices()
+            .registerIfAbsent("nativeConfigurationService", GraalVMReachabilityMetadataService.class, spec -> {
+                LogLevel logLevel = determineLogLevel();
+                spec.getMaxParallelUsages().set(1);
+                spec.getParameters().getLogLevel().set(logLevel);
+                spec.getParameters().getUri().set(repositoryExtension.getUri().map(serializableTransformerOf(configuredUri -> computeMetadataRepositoryUri(project, repositoryExtension, m -> logFallbackToDefaultUri(m, logger)))));
+                spec.getParameters().getCacheDir().set(
+                    new File(project.getGradle().getGradleUserHomeDir(), "native-build-tools/repositories"));
+                spec.getParameters().getBackoffMaxRetries().convention(
+                    GradleUtils.intProperty(project.getProviders(), "exponential.backoff.max.retries", 3)
+                );
+                spec.getParameters().getInitialBackoffMillis().convention(
+                    GradleUtils.intProperty(project.getProviders(), "exponential.backoff.initial.delay", 100)
+                );
+            });
     }
 
     private static void logFallbackToDefaultUri(URI defaultUri, GraalVMLogger logger) {
@@ -499,9 +584,9 @@ public class NativeImagePlugin implements Plugin<Project> {
             Dependency e = project.getDependencies().create(REPOSITORY_COORDINATES);
             configuration.getDependencies().add(e);
             Set<File> files = configuration.getIncoming()
-                    .artifactView(view -> view.setLenient(true))
-                    .getFiles()
-                    .getFiles();
+                .artifactView(view -> view.setLenient(true))
+                .getFiles()
+                .getFiles();
             if (files.size() == 1) {
                 return files.iterator().next().toURI();
             } else {
@@ -513,10 +598,10 @@ public class NativeImagePlugin implements Plugin<Project> {
 
     private void configureJvmReachabilityExcludeConfigArgs(Project project, GraalVMExtension graalExtension, NativeImageOptions options, SourceSet sourceSet) {
         options.getExcludeConfig().putAll(
-                graalVMReachabilityQueryForExcludeList(project,
-                        graalExtension,
-                        sourceSet,
-                        DirectoryConfiguration::isOverride)
+            graalVMReachabilityQueryForExcludeList(project,
+                graalExtension,
+                sourceSet,
+                DirectoryConfiguration::isOverride)
         );
         GraalVMReachabilityMetadataRepositoryExtension repositoryExtension = reachabilityExtensionOn(graalExtension);
         graalVMReachabilityMetadataService(project, repositoryExtension);
@@ -545,16 +630,16 @@ public class NativeImagePlugin implements Plugin<Project> {
         TaskProvider<Jar> classpathJar = tasks.register(baseName + "ClasspathJar", Jar.class, jar -> {
             jar.setDescription("Builds a pathing jar for the " + options.getName() + " native binary");
             jar.from(
-                    options.getClasspath()
-                            .getElements()
-                            .map(elems -> elems.stream()
-                                    .map(e -> {
-                                        if (isJar(e)) {
-                                            return getArchiveOperations().zipTree(e);
-                                        }
-                                        return e;
-                                    })
-                                    .collect(Collectors.toList()))
+                options.getClasspath()
+                    .getElements()
+                    .map(elems -> elems.stream()
+                        .map(e -> {
+                            if (isJar(e)) {
+                                return getArchiveOperations().zipTree(e);
+                            }
+                            return e;
+                        })
+                        .collect(Collectors.toList()))
             );
             jar.setDuplicatesStrategy(DuplicatesStrategy.WARN);
             jar.getArchiveBaseName().set(baseName.toLowerCase(Locale.ENGLISH) + "-classpath");
@@ -572,19 +657,19 @@ public class NativeImagePlugin implements Plugin<Project> {
 
     private GraalVMExtension registerGraalVMExtension(Project project) {
         NamedDomainObjectContainer<NativeImageOptions> nativeImages = project.getObjects()
-                .domainObjectContainer(NativeImageOptions.class, name ->
-                        project.getObjects().newInstance(BaseNativeImageOptions.class,
-                                name,
-                                project.getObjects(),
-                                project.getProviders(),
-                                project.getExtensions().findByType(JavaToolchainService.class),
-                                project.getName())
-                );
+            .domainObjectContainer(NativeImageOptions.class, name ->
+                project.getObjects().newInstance(BaseNativeImageOptions.class,
+                    name,
+                    project.getObjects(),
+                    project.getProviders(),
+                    project.getExtensions().findByType(JavaToolchainService.class),
+                    project.getName())
+            );
         GraalVMExtension graalvmNative = project.getExtensions().create(GraalVMExtension.class, "graalvmNative",
-                DefaultGraalVmExtension.class, nativeImages, this, project);
+            DefaultGraalVmExtension.class, nativeImages, this, project);
         graalvmNative.getGeneratedResourcesDirectory().set(project.getLayout()
-                .getBuildDirectory()
-                .dir("native/generated/"));
+            .getBuildDirectory()
+            .dir("native/generated/"));
         configureNativeConfigurationRepo((ExtensionAware) graalvmNative);
         return graalvmNative;
     }
@@ -683,23 +768,23 @@ public class NativeImagePlugin implements Plugin<Project> {
      */
     private static Provider<String> agentProperty(Project project, AgentOptions options) {
         return project.getProviders()
-                .gradleProperty(AGENT_PROPERTY)
-                .map(serializableTransformerOf(v -> {
-                    if (!v.isEmpty()) {
-                        return v;
-                    }
-                    return options.getDefaultMode().get();
-                }))
-                .orElse(options.getEnabled().map(serializableTransformerOf(enabled -> enabled ? options.getDefaultMode().get() : "disabled")));
+            .gradleProperty(AGENT_PROPERTY)
+            .map(serializableTransformerOf(v -> {
+                if (!v.isEmpty()) {
+                    return v;
+                }
+                return options.getDefaultMode().get();
+            }))
+            .orElse(options.getEnabled().map(serializableTransformerOf(enabled -> enabled ? options.getDefaultMode().get() : "disabled")));
     }
 
     private static void registerServiceProvider(Project project, Provider<NativeImageService> nativeImageServiceProvider) {
         project.getTasks()
-                .withType(BuildNativeImageTask.class)
-                .configureEach(task -> {
-                    task.usesService(nativeImageServiceProvider);
-                    task.getService().set(nativeImageServiceProvider);
-                });
+            .withType(BuildNativeImageTask.class)
+            .configureEach(task -> {
+                task.usesService(nativeImageServiceProvider);
+                task.getService().set(nativeImageServiceProvider);
+            });
     }
 
     private static String capitalize(String name) {
@@ -736,30 +821,32 @@ public class NativeImagePlugin implements Plugin<Project> {
         return new NativeConfigurations(compileOnly, classpath);
     }
 
-    private static NativeImageOptions createMainOptions(GraalVMExtension graalExtension, Project project) {
+    private NativeImageOptions createMainOptions(GraalVMExtension graalExtension, Project project) {
         NativeImageOptions buildExtension = graalExtension.getBinaries().create(NATIVE_MAIN_EXTENSION);
         NativeConfigurations configs = createNativeConfigurations(
-                project,
-                "main",
-                JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME
+            project,
+            "main",
+            JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME
         );
         setupExtensionConfigExcludes(buildExtension, configs);
         buildExtension.getClasspath().from(configs.getImageClasspathConfiguration());
+        optionsToConfigurations.put(buildExtension, configs);
         return buildExtension;
     }
 
 
-    private static NativeImageOptions createTestOptions(GraalVMExtension graalExtension,
-                                                        String binaryName,
-                                                        Project project,
-                                                        NativeImageOptions mainExtension,
-                                                        SourceSet sourceSet) {
+    private NativeImageOptions createTestOptions(GraalVMExtension graalExtension,
+                                                 String binaryName,
+                                                 Project project,
+                                                 NativeImageOptions mainExtension,
+                                                 SourceSet sourceSet) {
         NativeImageOptions testExtension = graalExtension.getBinaries().create(binaryName);
         NativeConfigurations configs = createNativeConfigurations(
-                project,
-                binaryName,
-                JavaPlugin.TEST_RUNTIME_CLASSPATH_CONFIGURATION_NAME
+            project,
+            binaryName,
+            JavaPlugin.TEST_RUNTIME_CLASSPATH_CONFIGURATION_NAME
         );
+        optionsToConfigurations.put(testExtension, configs);
         setupExtensionConfigExcludes(testExtension, configs);
 
         testExtension.getMainClass().set("org.graalvm.junit.platform.NativeImageJUnitLauncher");
@@ -794,22 +881,22 @@ public class NativeImagePlugin implements Plugin<Project> {
                     String dependency = (String) entry;
                     // Resolve jar for this dependency.
                     configs.getImageClasspathConfiguration().getIncoming().artifactView(view -> {
-                                view.setLenient(true);
-                                view.componentFilter(id -> {
-                                    if (id instanceof ModuleComponentIdentifier) {
-                                        ModuleComponentIdentifier mid = (ModuleComponentIdentifier) id;
-                                        String gav = String.format("%s:%s:%s",
-                                                mid.getGroup(),
-                                                mid.getModule(),
-                                                mid.getVersion()
-                                        );
-                                        return gav.startsWith(dependency);
-                                    }
-                                    return false;
-                                });
-                            }).getFiles().getFiles().stream()
-                            .map(File::toPath)
-                            .forEach(jarPath -> addExcludeConfigArg(args, jarPath, listOfResourcePatterns));
+                            view.setLenient(true);
+                            view.componentFilter(id -> {
+                                if (id instanceof ModuleComponentIdentifier) {
+                                    ModuleComponentIdentifier mid = (ModuleComponentIdentifier) id;
+                                    String gav = String.format("%s:%s:%s",
+                                        mid.getGroup(),
+                                        mid.getModule(),
+                                        mid.getVersion()
+                                    );
+                                    return gav.startsWith(dependency);
+                                }
+                                return false;
+                            });
+                        }).getFiles().getFiles().stream()
+                        .map(File::toPath)
+                        .forEach(jarPath -> addExcludeConfigArg(args, jarPath, listOfResourcePatterns));
                 } else {
                     throw new UnsupportedOperationException("Expected File or GAV coordinate for excludeConfig option, got " + entry.getClass());
                 }
@@ -820,11 +907,11 @@ public class NativeImagePlugin implements Plugin<Project> {
 
     private static List<String> agentSessionDirectories(Directory outputDirectory) {
         return Arrays.stream(Objects.requireNonNull(
-                                outputDirectory.getAsFile()
-                                        .listFiles(file -> file.isDirectory() && file.getName().startsWith("session-"))
-                        )
-                ).map(File::getAbsolutePath)
-                .collect(Collectors.toList());
+                    outputDirectory.getAsFile()
+                        .listFiles(file -> file.isDirectory() && file.getName().startsWith("session-"))
+                )
+            ).map(File::getAbsolutePath)
+            .collect(Collectors.toList());
     }
 
     private void configureAgent(Project project,
@@ -860,21 +947,21 @@ public class NativeImagePlugin implements Plugin<Project> {
         javaForkOptions.getJvmArgumentProviders().add(cliProvider);
 
         taskToInstrument.doLast(new MergeAgentFilesAction(
-                isMergingEnabled,
-                agentModeProvider,
-                project.provider(() -> false),
-                project.getObjects(),
-                graalvmHomeProvider(project.getProviders()),
-                mergeInputDirs,
-                mergeOutputDirs,
-                graalExtension.getToolchainDetection(),
-                execOperations));
+            isMergingEnabled,
+            agentModeProvider,
+            project.provider(() -> false),
+            project.getObjects(),
+            graalvmHomeProvider(project.getProviders()),
+            mergeInputDirs,
+            mergeOutputDirs,
+            graalExtension.getToolchainDetection(),
+            execOperations));
 
         taskToInstrument.doLast(new CleanupAgentFilesAction(mergeInputDirs, fileOperations));
 
         taskToInstrument.doLast(new ProcessGeneratedGraalResourceFilesAction(
-                outputDir,
-                graalExtension.getAgent().getFilterableEntries()
+            outputDir,
+            graalExtension.getAgent().getFilterableEntries()
         ));
     }
 
@@ -933,6 +1020,211 @@ public class NativeImagePlugin implements Plugin<Project> {
 
         public List<String> getExcludes() {
             return excludes;
+        }
+    }
+
+    private static class NativeImageOptionsForDependencies implements NativeImageOptions {
+        private final NativeImageOptions options;
+        private final ArtifactCollection artifacts;
+        private final ObjectFactory objects;
+
+        public NativeImageOptionsForDependencies(NativeImageOptions options, ArtifactCollection artifacts, ObjectFactory objects) {
+            this.options = options;
+            this.artifacts = artifacts;
+            this.objects = objects;
+        }
+
+        @Override
+        public String getName() {
+            return options.getName();
+        }
+
+        @Override
+        public void resources(Action<? super NativeResourcesOptions> spec) {
+            options.resources(spec);
+        }
+
+        @Override
+        public NativeImageOptions buildArgs(Object... buildArgs) {
+            return options.buildArgs(buildArgs);
+        }
+
+        @Override
+        public NativeImageOptions buildArgs(Iterable<?> buildArgs) {
+            return options.buildArgs(buildArgs);
+        }
+
+        @Override
+        public NativeImageOptions systemProperties(Map<String, ?> properties) {
+            return options.systemProperties(properties);
+        }
+
+        @Override
+        public NativeImageOptions systemProperty(String name, Object value) {
+            return options.systemProperty(name, value);
+        }
+
+        @Override
+        public NativeImageOptions classpath(Object... paths) {
+            return options.classpath(paths);
+        }
+
+        @Override
+        public NativeImageOptions jvmArgs(Object... arguments) {
+            return options.jvmArgs(arguments);
+        }
+
+        @Override
+        public NativeImageOptions jvmArgs(Iterable<?> arguments) {
+            return options.jvmArgs(arguments);
+        }
+
+        @Override
+        public NativeImageOptions runtimeArgs(Object... arguments) {
+            return options.runtimeArgs(arguments);
+        }
+
+        @Override
+        public NativeImageOptions runtimeArgs(Iterable<?> arguments) {
+            return options.runtimeArgs(arguments);
+        }
+
+        @Override
+        public void agent(Action<? super DeprecatedAgentOptions> spec) {
+            options.agent(spec);
+        }
+
+        @Override
+        public Property<String> getRequiredVersion() {
+            return options.getRequiredVersion();
+        }
+
+        @Override
+        public Property<String> getMainClass() {
+            return objects.property(String.class);
+        }
+
+        @Override
+        public ListProperty<String> getBuildArgs() {
+            return options.getBuildArgs();
+        }
+
+        @Override
+        public MapProperty<String, Object> getSystemProperties() {
+            return options.getSystemProperties();
+        }
+
+        @Override
+        public MapProperty<String, Object> getEnvironmentVariables() {
+            return options.getEnvironmentVariables();
+        }
+
+        @Override
+        public ConfigurableFileCollection getClasspath() {
+            var classpath = objects.fileCollection();
+            var externalDependencies = artifacts
+                .getResolvedArtifacts()
+                .map(resolvedArtifacts -> resolvedArtifacts.stream()
+                    .map(ResolvedArtifactResult::getFile)
+                    .collect(Collectors.toList())
+                );
+            classpath.from(externalDependencies);
+            return classpath;
+        }
+
+        @Override
+        public ListProperty<String> getJvmArgs() {
+            return options.getJvmArgs();
+        }
+
+        @Override
+        public Property<Boolean> getDebug() {
+            return options.getDebug();
+        }
+
+        @Override
+        public Property<Boolean> getFallback() {
+            return options.getFallback();
+        }
+
+        @Override
+        public Property<Boolean> getVerbose() {
+            return options.getVerbose();
+        }
+
+        @Override
+        public Property<Boolean> getSharedLibrary() {
+            return options.getSharedLibrary();
+        }
+
+        @Override
+        public Property<Boolean> getQuickBuild() {
+            return options.getQuickBuild();
+        }
+
+        @Override
+        public Property<Boolean> getRichOutput() {
+            return options.getRichOutput();
+        }
+
+        @Override
+        public MapProperty<Object, List<String>> getExcludeConfig() {
+            return options.getExcludeConfig();
+        }
+
+        @Override
+        public NativeResourcesOptions getResources() {
+            return options.getResources();
+        }
+
+        @Override
+        public ConfigurableFileCollection getConfigurationFileDirectories() {
+            return options.getConfigurationFileDirectories();
+        }
+
+        @Override
+        public ListProperty<String> getExcludeConfigArgs() {
+            return options.getExcludeConfigArgs();
+        }
+
+        @Override
+        public Property<String> getImageName() {
+            return options.getImageName();
+        }
+
+        @Override
+        public Property<JavaLauncher> getJavaLauncher() {
+            return options.getJavaLauncher();
+        }
+
+        @Override
+        public Property<Boolean> getUseFatJar() {
+            return options.getUseFatJar();
+        }
+
+        @Override
+        public DeprecatedAgentOptions getAgent() {
+            return options.getAgent();
+        }
+
+        @Override
+        public Property<Boolean> getPgoInstrument() {
+            return options.getPgoInstrument();
+        }
+
+        @Override
+        public DirectoryProperty getPgoProfilesDirectory() {
+            return options.getPgoProfilesDirectory();
+        }
+
+        @Override
+        public Property<Boolean> getUseLayers() {
+            return options.getUseLayers();
+        }
+
+        @Override
+        public ListProperty<String> getRuntimeArgs() {
+            return options.getRuntimeArgs();
         }
     }
 }
